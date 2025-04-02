@@ -1,0 +1,467 @@
+---
+title: "DuckDB Tutorial"
+author: "Nick Sayresmith"
+date: last-modified
+format: 
+  html: 
+    toc: true
+    toc-location: right
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    fig-width: 6
+    fig-asp: 0.618
+    out-width: "70%"
+    fig-align: center
+    fig-format: png
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  cache: true
+editor_options: 
+  chunk_output_type: console
+---
+
+Messing around with DuckDB per their [documentation](https://duckdb.org/docs/stable/clients/r.html). Also see this [analysis](https://bwlewis.github.io/duckdb_and_r/taxi/taxi.html#:~:text=The%20vroom%20way%20took%20about,is%20the%20way%20to%20go.) by Lewis.
+
+DuckDB is directly integrated to dplyr through [duckplyr](https://duckplyr.tidyverse.org/).
+
+## libs and functions
+
+```{r}
+library(conflicted)
+library(duckdb)
+library(tidyverse)
+library(duckplyr)
+library(here)
+library(vroom)
+
+conflicts_prefer(duckplyr::read_csv_duckdb, , quiet = T)
+conflict_prefer("filter", "dplyr", quiet = T)
+```
+
+```{r}
+#| label: my_name_repair
+
+my_name_repair <- function(col_name) {
+  
+  c_escape_underscore <- c(".", "-", "&", " ") %>% 
+    str_c("\\", ., collapse = "|")
+  
+  c_nonescape_underscore <- c("\r\n") %>% 
+    str_c(., collapse = "|")
+  
+  c_replace_underscore <- str_c(c_escape_underscore, "|",
+                                c_nonescape_underscore
+                                )
+  
+  c_escape_remove <- c("(", ")", "?") %>% 
+    str_c("\\", ., collapse = "|")
+  
+  col_name %>% 
+    str_replace_all(c_replace_underscore, "_") %>% 
+    str_replace_all("\\/", "_per_") %>% 
+    str_replace_all(c_escape_remove, "") %>% 
+    str_replace_all("__+", "_") %>% 
+    str_replace_all("_$", "") %>% 
+    str_to_lower()
+}
+```
+
+## DuckDB
+
+```{r}
+#| label: R-files
+
+con <- dbConnect(duckdb())
+duckdb_register(con, "flights", nycflights13::flights)
+
+tbl(con, "flights") |>
+  group_by(dest) |>
+  summarise(delay = mean(dep_time, na.rm = TRUE)) |>
+  collect()
+```
+
+```{r}
+#| label: csv
+
+# Establish a CSV for the sake of this example
+write.csv(mtcars, "mtcars.csv")
+
+# Summarize the dataset in DuckDB to avoid reading the entire CSV into R's memory
+tbl(con, "mtcars.csv") |>
+  group_by(cyl) |>
+  summarise(across(disp:wt, .fns = mean)) |>
+  collect()
+```
+
+```{r}
+#| label: parquet
+
+# Establish a set of Parquet files
+dbExecute(
+  con, 
+  "COPY flights TO 'dataset' (FORMAT parquet, PARTITION_BY (year, month))"
+  )
+
+# Summarize the dataset in DuckDB to avoid reading 12 Parquet files into R's memory
+tbl(con, "read_parquet('dataset/**/*.parquet', hive_partitioning = true)") |>
+  filter(month == "3") |>
+  summarise(delay = mean(dep_time, na.rm = TRUE)) |>
+  collect()
+```
+
+## duckplyr
+
+### Small Data
+
+```{r}
+#| label: small-data
+
+out <-
+  flights_df() |>
+  filter(!is.na(arr_delay), !is.na(dep_delay)) |>
+  mutate(inflight_delay = arr_delay - dep_delay) |>
+  summarize(
+    .by = c(year, month),
+    mean_inflight_delay = mean(inflight_delay),
+    median_inflight_delay = median(inflight_delay),
+  ) |>
+  filter(month <= 6) |> 
+  arrange(month)
+```
+
+### Large Data
+
+```{r}
+#| label: build-paths
+
+year <- 2022:2024
+base_url <- "https://blobs.duckdb.org/flight-data-partitioned/"
+files <- paste0("Year=", year, "/data_0.parquet")
+urls <- paste0(base_url, files)
+tibble(urls)
+```
+
+No need to even download if using [httpfs](https://duckdb.org/docs/stable/extensions/httpfs/overview.html)
+
+```{r}
+#| label: install-load-httpfs
+
+db_exec("INSTALL httpfs")
+db_exec("LOAD httpfs")
+```
+
+```{r}
+#| label: read-httpfs
+
+flights <- read_parquet_duckdb(urls)
+```
+
+Non-duckplyr functions won't work on queries. Have to materialize first using something like collect(). However, collect() will try to pull the whole query response into RAM; this may cause a memory allocation error if the response is too large.
+
+```{r}
+#| label: bad-calls
+
+# nrow() is a base function. Won't work.
+nrow(flights)
+
+# flights is too big for memory. collect() will errors out on memory allocation. 
+flights |> collect() 
+```
+
+Loading duckplyr overwrote dplyr's count function, i.e. count is safe to use.
+
+```{r}
+#| label: good-call
+
+
+flights |> count(Year)
+```
+
+```{r}
+#| label: complex-call
+
+out <-
+  flights |>
+  mutate(InFlightDelay = ArrDelay - DepDelay) |>
+  summarize(
+    .by = c(Year, Month),
+    MeanInFlightDelay = mean(InFlightDelay, na.rm = TRUE),
+    MedianInFlightDelay = median(InFlightDelay, na.rm = TRUE),
+  ) |>
+  filter(Year < 2024)
+
+out |>
+  explain()
+
+out |> print()
+```
+
+Can bring summary into memory with collect(). Unless as_tibble() is called, the Environment obs. Value = "??". Might be a bug, since the the collected querry is a tbl.
+
+```{r}
+#| label: collect
+
+out_collect <- out |> collect() |> as_tibble()
+```
+
+## Hourly Emissions Data
+
+```{r}
+#| label: vroom
+
+tb_CAMPD_hourly_NC_2023_raw <-
+  vroom(
+    path_hr_em_2018_nc,
+    col_select = all_of(names(ls_cols)),
+    col_types = ls_cols,
+    ) %>% 
+  rename_with(my_name_repair)
+
+tb_CAMPD_hourly_NC_2023 <- tb_CAMPD_hourly_NC_2023_raw %>% 
+  drop_na(nox_rate_lbs_per_mmbtu) %>%  
+  filter(str_detect(unit_type, "Combined cycle|Combustion turbine")) %>% 
+  filter(nox_rate_measure_indicator == "Measured") %>% 
+  mutate(nox_controls = 
+           str_replace_all(nox_controls, c_replace)
+         ) %>% 
+  mutate(water_inj = str_detect(nox_controls, "wet"),
+         dry_low = str_detect(nox_controls, "dry"),
+         SCR = str_detect(nox_controls, "SCR")
+         ) %>% 
+  mutate(date_time = date + hours(hour))
+```
+
+```{r}
+#| label: hourly-emissions
+
+path_hr_em_2018_nc <- 
+  str_c(
+    "C:/Users/NSayresm/OneDrive - Environmental Protection Agency (EPA)/ESG/",
+    "NSPS_CTs/NSPS_code/input/CAMPD/",
+    "emissions-hourly-2018-nc.csv")
+
+ls_cols <- c("Facility ID" = "character", "Facility Name" = "character",
+             "Unit ID" = "character", 
+             "Date" = "Date", 
+             "Hour" = "double", "Operating Time" = "double", 
+             "NOx Rate (lbs/mmBtu)" = "double",
+             "NOx Rate Measure Indicator" = "character",
+             "Unit Type" = "character", "NOx Controls" = "character"
+             )
+
+con <- dbConnect(duckdb())
+
+tb_hourly_em <- tbl(con, path_hr_em_2018_nc) |> 
+  select(all_of(names(ls_cols))) |> collect()
+  filter(!is.na(`NOx Rate (lbs/mmBtu)`)) |> 
+  filter(str_detect(`Unit Type`, "Combined cycle|Combustion turbine")) |> 
+  filter(`NOx Rate Measure Indicator` == "Measured") |> 
+  collect() |> 
+  rename_with(my_name_repair)
+```
+
+janitor::clean_names() messed up NOx rename. Using my own function.
+
+```{r}
+#| label: hr-em-summary
+
+c_replace <- c("Water Injection" = "wet",
+               "Dry Low NOx Burners" = "dry",
+               "Selective Catalytic Reduction" = "SCR",
+               "," = ", "
+               )
+
+tb_hourly_em_summary <- tb_hourly_em |> 
+  mutate(unit_type = 
+           case_when(
+             str_detect(unit_type, "Combustion turbine") ~ "combustion turbine",
+             str_detect(unit_type, "Combined cycle") ~ "combined cycle"
+           ),
+         nox_controls = str_replace_all(nox_controls, c_replace)
+         ) |> 
+  group_by(unit_type, nox_controls) |>
+  reframe(prob = c("min" = 0.00, "5th_percentile" = 0.05, 
+                   "median" = 0.50, 
+                   "95th percentile" = 0.95, "max" = 1.00),
+          quant = quantile(nox_rate_lbs_per_mmbtu, prob),
+          ) |> 
+  mutate(prob = names(prob)) |> 
+  pivot_wider(names_from = prob, values_from = quant, 
+              names_prefix = "nox_rate_")
+
+tb_hourly_em_summary <- tbl(con, path_hr_em_2018_nc) |> 
+  select(all_of(names(ls_cols))) |> 
+  filter(!is.na(`NOx Rate (lbs/mmBtu)`)) |> 
+  filter(str_detect(`Unit Type`, "Combined cycle|Combustion turbine")) |> 
+  filter(`NOx Rate Measure Indicator` == "Measured") |> 
+  group_by(`Unit Type`, `NOx Controls`) |> 
+  summarise(n_units = n(),
+            nox_rate_lbs_per_mmbtu_min = min(`NOx Rate (lbs/mmBtu)`),
+            nox_rate_lbs_per_mmbtu_max = max(`NOx Rate (lbs/mmBtu)`),
+            nox_rate_lbs_per_mmbtu_median = median(`NOx Rate (lbs/mmBtu)`),
+            ) |> 
+  collect() |> 
+  rename_with(my_name_repair)
+```
+
+DuckDB is reading **Operating Hours** column as an integer. Made a subset of the hourly emissions data to play around. DuckDB uses it's own datatype names (see [doc](https://duckdb.org/docs/stable/sql/data_types/overview.html)). 
+
+```{r}
+#| label: data-type
+
+path_op_hrs <- 
+  str_c(
+    "C:/Users/NSayresm/OneDrive - Environmental Protection Agency (EPA)/ESG/",
+    "tutorial_duckdb/DuckDB/",
+    "emissions-hourly-2018-nc_op_hrs.csv")
+
+test_tb <- read_csv_duckdb(path_op_hrs,
+                           options = list(types = list("FLOAT"))) |> 
+  select(`Operating Time`) |> 
+  collect()
+```
+
+Specifying *FLOAT* fixes issue.
+
+```{r}
+#| label: col-names-types
+
+path_hr_em_2018_nc <- 
+  str_c(
+    "C:/Users/NSayresm/OneDrive - Environmental Protection Agency (EPA)/ESG/",
+    "NSPS_CTs/NSPS_code/input/CAMPD/",
+    "emissions-hourly-2018-nc.csv")
+
+peak <- vroom(path_hr_em_2018_nc, n_max = 100)
+
+col_name_types <- peak |> spec()
+
+col_name_types <- c(
+  State = "VARCHAR",
+  `Facility Name` = "VARCHAR",
+  `Facility ID` = "VARCHAR",
+  `Unit ID` = "VARCHAR",
+  `Associated Stacks` = "VARCHAR",
+  Date = "DATE",
+  Hour = "INTEGER",
+  `Operating Time` = "FLOAT",
+  `Gross Load (MW)` = "FLOAT",
+  `Steam Load (1000 lb/hr)` = "FLOAT",
+  `SO2 Mass (lbs)` = "FLOAT",
+  `SO2 Mass Measure Indicator` = "VARCHAR",
+  `SO2 Rate (lbs/mmBtu)` = "FLOAT",
+  `SO2 Rate Measure Indicator` = "VARCHAR",
+  `CO2 Mass (short tons)` = "FLOAT",
+  `CO2 Mass Measure Indicator` = "VARCHAR",
+  `CO2 Rate (short tons/mmBtu)` = "FLOAT",
+  `CO2 Rate Measure Indicator` = "VARCHAR",
+  `NOx Mass (lbs)` = "FLOAT",
+  `NOx Mass Measure Indicator` = "VARCHAR",
+  `NOx Rate (lbs/mmBtu)` = "FLOAT",
+  `NOx Rate Measure Indicator` = "VARCHAR",
+  `Heat Input (mmBtu)` = "FLOAT",
+  `Heat Input Measure Indicator` = "VARCHAR",
+  `Primary Fuel Type` = "VARCHAR",
+  `Secondary Fuel Type` = "VARCHAR",
+  `Unit Type` = "VARCHAR",
+  `SO2 Controls` = "VARCHAR",
+  `NOx Controls` = "VARCHAR",
+  `PM Controls` = "VARCHAR",
+  `Hg Controls` = "VARCHAR",
+  `Program Code` = "VARCHAR"
+)
+```
+
+```{r}
+#| label: read-hr-em
+
+con <- dbConnect(duckdb())
+
+# with duckdb
+db_hourly_em <- duckdb_read_csv(con, "hr_em_2018_nc", path_hr_em_2018_nc,
+                                col.types = col_name_types)
+
+# with duckplyr
+duck_hourly_em_raw <- 
+  read_csv_duckdb(
+    path_hr_em_2018_nc,
+    options = list(types = list(col_name_types))
+    ) |> 
+  compute()
+
+duck_hourly_em <- duck_hourly_em_raw |> 
+  select(all_of(names(col_name_types))) |>
+  filter(!is.na(`NOx Rate (lbs/mmBtu)`) & `NOx Rate (lbs/mmBtu)` > 0) |> 
+  filter(
+    `Unit Type` == "Combined cycle" | `Unit Type` == "Combustion turbine") |> 
+  filter(`NOx Rate Measure Indicator` == "Measured")  
+
+duck_hourly_em |> colnames()
+```
+
+```{r}
+#| label: hr_em_summary_duck
+
+c_replace <- c("Water Injection" = "wet",
+               "Dry Low NOx Burners" = "dry",
+               "Selective Catalytic Reduction" = "SCR",
+               "," = ", "
+               )
+
+tb_hr_em_ecdf <- duck_hourly_em |> 
+  compute(prudence = "lavish") |> 
+  pluck("NOx Rate (lbs/mmBtu)") |> 
+  ecdf()
+
+tb_hr_em_ecdf <- duck_hourly_em |> 
+  compute(prudence = "lavish") |> 
+  select(`Unit Type`, `NOx Controls`, `NOx Rate (lbs/mmBtu)`) |> collect()
+  nest(nox_rate = `NOx Rate (lbs/mmBtu)`) |> 
+  mutate(ecdf = map(nox_rate, \(rate) ecdf(unlist(rate))))
+  
+tb_hr_em_ecdf |> 
+  ggplot(aes(`NOx Rate (lbs/mmBtu)`, color = `NOx Controls`)) + 
+  stat_ecdf(geom = "point", pad = F) +
+  facet_wrap(vars(`Unit Type`))
+  
+tb_hr_em_summary <- duck_hourly_em |> 
+  compute(prudence = "lavish") |> 
+  # summarise(
+  #   .by = c(`Unit Type`, `NOx Controls`),
+  #   n_hr_op = sum(`Operating Time`),
+  #   nox_rate_min = min(`NOx Rate (lbs/mmBtu)`),
+  #   nox_rate_5th_perc = quantile(`NOx Rate (lbs/mmBtu)`, 0.05),
+  #   nox_rate_median = median(`NOx Rate (lbs/mmBtu)`),
+  #   nox_rate_max = max(`NOx Rate (lbs/mmBtu)`),
+  #   ) |>
+  reframe(
+    .by = c(`Unit Type`, `NOx Controls`),
+    n_hr_op = sum(`Operating Time`),
+    prob = c("min" = 0.00, "5th_percentile" = 0.05, 
+             "median" = 0.50, 
+             "95th percentile" = 0.95, "max" = 1.00),
+    quant = quantile(`NOx Rate (lbs/mmBtu)`, prob),
+    ) |> 
+  mutate(prob = names(prob)) |> 
+  pivot_wider(names_from = prob, values_from = quant, 
+              names_prefix = "nox_rate_") |> 
+  collect() |> 
+  mutate(`Unit Type` = 
+           case_when(
+             str_detect(
+               `Unit Type`, "Combustion turbine") ~ "combustion turbine",
+             str_detect(`Unit Type`, "Combined cycle") ~ "combined cycle"
+           ),
+         `NOx Controls` = str_replace_all(`NOx Controls`, c_replace)
+         ) |> 
+  rename_with(my_name_repair)
+```
+
+dplyr is the grammar of data manipulation in the tidyverse. duckplyr uses DuckDB for faster computation while maintaining dplyr grammar. duckplyr aims to be a fully compatible drop-in replacement for dplyr. No SQL is generated, only DuckDB's "relational" interface is used.
+
+dbplyr translates dplyr code to Structured Query Language (SQL). SQL is a 40+ old language that almost all databases can use. The SQL code is then executed through database (DB) connections that can be coordinated by the DBI package. dbplyr does not need to be explicitly loaded with **library(dbplyr)**; it will load automatically if it sees you working with a DB.
+
+DBI is a package that allows R to interface with a variety of databases (e.g., mySQL, DuckDB, ODBC). DBI does this through connections and drivers. For example, **dbConnect(duckdb())** uses the DBI function **dbConnect()** to connect to the DuckDB driver.
